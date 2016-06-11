@@ -14,7 +14,8 @@ using namespace std;
 #define WIDTH 256
 #define HEIGHT 256
 #define ASPECT WIDTH/HEIGHT
-#define SAMPLES 1000
+#define SAMPLES 1
+#define RPT 10
 #define MAX_DEPTH 128
 
 enum { NELEMS = WIDTH * HEIGHT };
@@ -23,13 +24,6 @@ typedef struct Ray {
 	float3 direction;
 	float3 origin;
 }Ray;
-
-typedef struct ray {
-	float3 origin;
-	float3 direction;
-	float3 radiance;
-	float terminate;
-} ray;
 
 typedef struct Camera {
 	float3 lowleftcorner;
@@ -46,6 +40,11 @@ typedef struct Material {
 	float ior;
 }Material;
 
+typedef struct Photon {
+	Ray reverse;
+	float distance;
+}Photon;
+
 typedef struct Polygon {
 	float3 dot[3];
 	float3 normal;
@@ -57,6 +56,8 @@ typedef struct Sphere {
 	float3 center;
 	float radius;
 	Material material;
+	Photon *photons;
+	int pn;
 }Sphere;
 
 typedef struct Hit_record {
@@ -74,6 +75,10 @@ __device__ float rand_f(curandState* globalState) {
 	float RANDOM = curand_uniform( &localState );
 	globalState[indx] = localState;
 	return RANDOM;
+}
+
+__device__ float rand_f2m1(curandState * gState) {
+	return rand_f(gState) * 2.0f - 1.0f;
 }
 
 //**************SUPPORTS_FUNCTIONS**************//
@@ -103,6 +108,11 @@ __device__ Ray shoot_ray(Camera &cam, curandState* gState) {
 	return tmp;
 }
 
+__device__ Ray shoot_ray(Sphere s, curandState *gState) {
+	float3 dir = normalize(make_float3(rand_f2m1(gState), rand_f2m1(gState), rand_f2m1(gState)));
+	return {dir, s.center + dir * s.radius};
+}
+
 __device__ float3 get_ray(Ray r, float k) {
 	return r.origin + k * r.direction;
 }
@@ -123,29 +133,13 @@ __device__ bool diffusion(curandState* gState, Ray r, Ray &scattered, Hit_record
 		return (dot(scattered.direction, rec.normal) > 0);
 	} else if (rec.material.refractivity == 0.0f) {
 		// matte
-		float3 v1 = {rand_f(gState), rand_f(gState), rand_f(gState)};
+		float3 v1 = {rand_f2m1(gState), rand_f2m1(gState), rand_f2m1(gState)};
 		v1 = normalize(v1);
 		if (dot(v1, rec.normal) < 0.0f) v1 = -v1;
 		scattered = {v1, rec.point};
 		attenuated = rec.material.color;
 		return true;
 	}
-
-	// if (rec.material.reflectivity == 0.0f && rec.material.refractivity == 0.0f) {
-	// 	// matte
-	// 	float3 v1 = {rand_f(gState), rand_f(gState), rand_f(gState)};
-	// 	v1 = normalize(v1);
-	// 	if (dot(v1, rec.normal) < 0.0f) v1 = -v1;
-	// 	scattered = {v1, rec.point};
-	// 	attenuated = rec.material.color;
-	// 	return true;
-	// } else if (rec.material.reflectivity > 0.0f && rec.material.refractivity == 0.0f) {
-	// 	// metal
-	// 	float3 refl = normalize(reflection(r.direction, rec.normal));
-	// 	scattered = {refl, rec.point};
-	// 	attenuated = rec.material.color;
-	// 	return (dot(scattered.direction, rec.normal) > 0);
-	// }
 	return true;
 }
 
@@ -171,7 +165,6 @@ __device__ bool get_intersection(Ray r, Hit_record &rec, float dist, Sphere s) {
 			return true;
 		}
 	}
-
 	return false;
 }
 
@@ -188,7 +181,7 @@ __device__ bool nearest_intersection (Ray r, Sphere *scene, Hit_record &rec, int
 
 }
 
-__device__ float3 raytrace(curandState* gState, Sphere *scene, Ray r, int n_obj) {
+__device__ float3 inverse_raytrace(curandState* gState, Sphere *scene, Ray r, int n_obj) {
 	Ray primary = r;
 	Hit_record rec;
 	float3 attenuated;
@@ -216,23 +209,62 @@ __device__ float3 raytrace(curandState* gState, Sphere *scene, Ray r, int n_obj)
 	// return composite + emitted * counted;
 }
 
+__device__ Photon direct_raytrace(curandState* gState, Sphere *scene, Ray r, int n_obj) {
+	Photon photon;
+	Ray primary = r;
+	Hit_record rec;
+	for (int i = 0; i < MAX_DEPTH; ++i) {
+		if (nearest_intersection(primary, scene, rec, n_obj)) {
+			if (rec.material.reflectivity == 0.0f) {
+				photon.reverse.origin = rec.point;
+				photon.distance = length(primary.origin - rec.point);
+				photon.reverse.direction = -r.direction;
+				return photon;
+			} else if (rec.material.reflectivity > 0.0f) {
+				float3 refl = normalize(reflection(primary.direction, rec.normal));
+				primary = {refl, rec.point};
+			} else if (length(rec.material.emissivity) > 0.0f) {
+				photon = {{{0, 0, 0}, {0, 0, 0}}, 0};
+				return photon;
+			}
+		} else {
+			photon = {{{0, 0, 0}, {0, 0, 0}}, 0};
+			return photon;
+		}
+	}
+	photon = {{{0, 0, 0}, {0, 0, 0}}, 0};
+	return photon;
+
+}
 
 
 //**************KERNEL**************//
 
-__global__ void kernel(curandState* gState, unsigned long seed, Sphere *scene, float3 *result, int n, int n_obj) {
+__global__ void direct(curandState* gState, unsigned long seed, Sphere *scene, Photon *result, int n_obj, int *ligths, int light_obj) {
+	int indx = blockDim.x * blockIdx.x + threadIdx.x;
+	curand_init (seed, indx, 0, &gState[indx]);
+	int j, shift = indx * RPT;
+	Ray primary;
+	for (int i = 0; i < RPT; ++i) {
+		j = ligths[(int)(rand_f(gState) * light_obj)];
+		primary = shoot_ray(scene[j], gState);
+		result[shift + i] = direct_raytrace(gState, scene, primary, n_obj);
+
+	}
+}
+
+__global__ void inverse(curandState* gState, Sphere *scene, float3 *result, int n, int n_obj) {
 	int indx = blockDim.x * blockIdx.x + threadIdx.x;
 	Camera cam;
-	create_camera(cam, make_float3(1, 100, 0), make_float3(0, 0, 0), 40.0f);
+	create_camera(cam, make_float3(-100, 50, 0), make_float3(0, -75, 0), 40.0f);
 	
 	if (indx < n) {
-		curand_init (seed, indx, 0, &gState[indx]);
 		Ray primary;
 		result[indx] = {0, 0, 0};
 		float scaled = 1.0f / (float) SAMPLES;
 		for (int i = 0; i < SAMPLES; ++i) {
 			primary = shoot_ray(cam, gState);
-			result[indx] += raytrace(gState, scene, primary, n_obj) * scaled;
+			result[indx] += inverse_raytrace(gState, scene, primary, n_obj) * scaled;
 		}
 	}
 }
@@ -247,7 +279,7 @@ __host__ inline int gamma_correction(float val) { return int(255.0f * sqrt(fmaxf
 __host__ void print_file_header(ofstream &file);
 __host__ void find_normal(Polygon &p);
 __host__ Sphere * init_spheres(int &n_obj);
-// __host__ Polygon * init_polygons(int &n_obj);
+__host__ Polygon * init_polygons(int &n_obj);
 __host__ void * alloc_mem_cpu(size_t size);
 __host__ void mem_cpy_to_gpu(void *d, void *g, size_t size);
 __host__ void * alloc_mem_gpu(size_t size);
@@ -259,37 +291,86 @@ int main() {
 	/* Allocate vectors on host */
 	int n_obj;
 	size_t sizer = sizeof(float3) * NELEMS;
-	size_t sizec = sizeof(curandState) * NELEMS; 
-	Sphere *h_scene = NULL;// = (Sphere *) alloc_mem_cpu(sizes);
-	float3 *h_result = (float3 *) alloc_mem_cpu(sizer);
+	size_t sizec = sizeof(curandState) * NELEMS;
+	size_t sizep = sizeof(Photon) * NELEMS * RPT;
+	Sphere *h_scene = NULL;
+	Photon *h_photon = (Photon *) alloc_mem_cpu(sizep);
+	
 
 	h_scene = init_spheres(n_obj);
 	size_t sizes = sizeof(Sphere) * n_obj;
+
+	int light_obj = 0;
+	for (int i = 0; i < n_obj; ++i) {
+		if (length(h_scene[i].material.emissivity) > 0)
+			++light_obj;
+	}
+	size_t sizel = sizeof(int *) * light_obj;
+	int *h_lights = (int *) alloc_mem_cpu(sizel);
+	for (int i = 0, j = 0; i < n_obj; ++i) {
+		if (length(h_scene[i].material.emissivity) > 0) {
+			h_lights[j] = i; 
+			++j;
+		}
+	}
 	/* Allocate vectors on device */
 	Sphere *d_scene = NULL;
-	float3 *d_result = NULL;
+	int *d_ligths = NULL;
+	Photon *d_photon = NULL;
 	curandState* d_states = NULL;
 
-	d_scene = (Sphere *)alloc_mem_gpu(sizes);
-	d_result = (float3 *)alloc_mem_gpu(sizer);    
-	d_states = (curandState*)alloc_mem_gpu(sizec);
+	d_scene = (Sphere *) alloc_mem_gpu(sizes);
+	d_ligths = (int *) alloc_mem_gpu(sizel);
+	d_photon = (Photon *) alloc_mem_gpu(sizep);   
+	d_states = (curandState*) alloc_mem_gpu(sizec);
 
 	/* Copy the host vectors to device */
 
 	mem_cpy_to_gpu(h_scene, d_scene, sizes);
+	mem_cpy_to_gpu(h_lights, d_ligths, sizel);
 
 	int threadsPerBlock = 128;
 	int blocksPerGrid =(NELEMS + threadsPerBlock - 1) / threadsPerBlock;
 
-	kernel<<<blocksPerGrid, threadsPerBlock>>>(d_states, time(NULL), d_scene, d_result, NELEMS, n_obj);
 
+	direct<<<blocksPerGrid, threadsPerBlock>>>(d_states, time(NULL), d_scene, d_photon, n_obj, d_ligths, light_obj);
 	cudaError_t error = cudaGetLastError();
 	if (error != cudaSuccess) {
-		cout << "Failed to launch kernel!\n";
+		cout << "Failed to launch Direct!\n";
+		cudaErrors(error);
+		exit(EXIT_FAILURE);
+	}
+	mem_cpy_to_cpu(d_photon, h_photon, sizep);
+	cout << "direct method is done!\n";
+
+	// ofstream fi_out("out");
+	// for (int i = 0; i < NELEMS * RPT; ++i) {
+	// 	if (h_photon[i].distance == 0) {
+	// 		Ray r = h_photon[i].reverse;
+	// 		fi_out << r.origin.x << ":" << r.origin.y << ":" << r.origin.z << "\t\t";
+	// 		fi_out << r.direction.x << ":" << r.direction.y << ":" << r.direction.z << "\t\t";
+	// 		fi_out << h_photon[i].distance << "\n";
+	// 	}
+	// }
+	// fi_out.close();
+	free(h_photon);
+	cudaFree(d_photon);
+
+	mem_cpy_to_gpu(h_scene, d_scene, sizes);
+	float3 *h_result = (float3 *) alloc_mem_cpu(sizer);
+	float3 *d_result = NULL;	
+	d_result = (float3 *) alloc_mem_gpu(sizer); 
+	inverse<<<blocksPerGrid, threadsPerBlock>>>(d_states, d_scene, d_result, NELEMS, n_obj);
+
+	error = cudaGetLastError();
+	if (error != cudaSuccess) {
+		cout << "Failed to launch Inverse!\n";
 		cudaErrors(error);
 		exit(EXIT_FAILURE);
 	}
 	mem_cpy_to_cpu(d_result, h_result, sizer);
+	cout << "inverse method is done!\n";
+	
 	ofstream fout("img.ppm");
 	fout << "P3\n" << WIDTH << " " << HEIGHT << "\n255\n";
 	for (int i = 0; i < NELEMS; ++i) {
@@ -298,7 +379,7 @@ int main() {
 				<< gamma_correction(h_result[i].z) << "\n";
 	}
 	fout.close();
-	cout << "We Fine!\n";
+	cout << "All is done!\n";
 	cudaFree(d_scene);
 	cudaFree(d_result);
 	cudaFree(d_states);
@@ -356,35 +437,38 @@ __host__ Sphere * init_spheres(int &n_obj) {
 		int tmp;
 		infile >> tmp;
 		scene[i].material = materials[tmp];
+		scene[i].photons = NULL;
+		scene[i].pn = 0;
 	}
 	infile.close();
 	free(materials);
 	return scene;
 }
-// __host__ Polygon * init_polygons(int &n_obj) {
-// 	int m;
-// 	Material *materials = init_materials(m);
-// 	ifstream infile("inPolygon");
-// 	infile >> n_obj;
 
-// 	size_t sizeScene = sizeof(Polygon) * n_obj;
-// 	Polygon *scene = (Polygon *)alloc_mem_cpu(sizeScene);
+__host__ Polygon * init_polygons(int &n_obj) {
+	int m;
+	Material *materials = init_materials(m);
+	ifstream infile("inPolygon");
+	infile >> n_obj;
 
-// 	for (int i = 0; i < n_obj; ++i) {
-// 		for (int j = 0; j < 3; ++j)
-// 	    	infile >> scene[i].dot[j].x >> scene[i].dot[j].y >> scene[i].dot[j].z;
-// 	    int tmp;
-// 	    infile >> tmp;
-// 	    scene[i].material = materials[tmp];
-// 	    find_normal(scene[i]);
-// 	    find_factor(scene[i]);
-// 	    // cout << scene[i].normal.x << ":" << scene[i].normal.y << ":" << scene[i].normal.z << "\n\n";
-// 	}
-// 	infile.close();
+	size_t sizeScene = sizeof(Polygon) * n_obj;
+	Polygon *scene = (Polygon *)alloc_mem_cpu(sizeScene);
 
-// 	free(materials);
-// 	return NULL;
-// }
+	for (int i = 0; i < n_obj; ++i) {
+		for (int j = 0; j < 3; ++j)
+	    	infile >> scene[i].dot[j].x >> scene[i].dot[j].y >> scene[i].dot[j].z;
+	    int tmp;
+	    infile >> tmp;
+	    scene[i].material = materials[tmp];
+	    find_normal(scene[i]);
+	    find_factor(scene[i]);
+	    // cout << scene[i].normal.x << ":" << scene[i].normal.y << ":" << scene[i].normal.z << "\n\n";
+	}
+	infile.close();
+
+	free(materials);
+	return scene;
+}
 
 __host__ void * alloc_mem_cpu(size_t size) {
 	void *ptr = malloc(size);
