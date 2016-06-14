@@ -215,36 +215,36 @@ __device__ float3 inverse_raytrace(curandState* gState, Path *pMap, int path_num
 			return {0, 0, 0};
 		}
 	}
-	// int it = (int) (rand_f(gState) * path_num);
-	// if (rec.material.reflectivity != 1) {
-	// 	float3 dir = pMap[it].reverse.origin - primary.origin;
-	// 	float dist = length(dir);
-	// 	dir = dir/dist;
-	// 	primary = {dir, primary.origin};
-	// 	if (nearest_intersection(primary, scene, rec, n_obj)) {
-	// 		if (length(rec.point - primary.origin) < dist) return {0, 0, 0};
-	// 		emitted = rec.material.emissivity;
-	// 		primary = { pMap[it].reverse.direction, pMap[it].reverse.origin};
-	// 		composite += emitted * counted;
-	// 		counted = counted * rec.material.color;
-	// 	}
-	// 	for (int i = 0; i < pMap[it].depth + 1; ++i) {
-	// 		if (nearest_intersection(primary, scene, rec, n_obj)) {
-	// 			// return rec.material.color;
-	// 			if (rec.material.reflectivity > 0) rec.material.reflectivity = 1;
-	// 			emitted = rec.material.emissivity;
-	// 			if (diffusion(gState, primary, scattered, rec, attenuated)) {
-	// 				primary = scattered;
-	// 				composite += emitted * counted;
-	// 				counted = counted * attenuated;
-	// 			} else {
-	// 				return composite + emitted * counted;
-	// 			}
-	// 		} else {
-	// 			return {0, 0, 0};
-	// 		}
-	// 	}
-	// }
+	int it = (int) (rand_f(gState) * path_num);
+	if (rec.material.reflectivity != 1) {
+		float3 dir = pMap[it].reverse.origin - primary.origin;
+		float dist = length(dir);
+		dir = dir/dist;
+		primary = {dir, primary.origin};
+		if (nearest_intersection(primary, scene, rec, n_obj)) {
+			if (length(rec.point - primary.origin) < dist) return {0, 0, 0};
+			emitted = rec.material.emissivity;
+			primary = { pMap[it].reverse.direction, pMap[it].reverse.origin};
+			composite += emitted * counted;
+			counted = counted * rec.material.color;
+		}
+		for (int i = 0; i < pMap[it].depth + 1; ++i) {
+			if (nearest_intersection(primary, scene, rec, n_obj)) {
+				// return rec.material.color;
+				if (rec.material.reflectivity > 0) rec.material.reflectivity = 1;
+				emitted = rec.material.emissivity;
+				if (diffusion(gState, primary, scattered, rec, attenuated)) {
+					primary = scattered;
+					composite += emitted * counted;
+					counted = counted * attenuated;
+				} else {
+					return composite + emitted * counted;
+				}
+			} else {
+				return {0, 0, 0};
+			}
+		}
+	}
 
 	return {0, 0, 0};
 	// return composite + emitted * counted;
