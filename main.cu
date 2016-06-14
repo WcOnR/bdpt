@@ -11,12 +11,12 @@
 
 using namespace std;
 
-#define WIDTH 256
-#define HEIGHT 256
+#define WIDTH 1024
+#define HEIGHT 1024
 #define ASPECT WIDTH/HEIGHT
-#define SAMPLES 1
-#define MAX_DEPTH 128
-#define RPT 10
+#define SAMPLES 1000
+#define MAX_DEPTH 16
+#define PPT 1
 #define BLOCKS 512
 #define THREADS 128
 
@@ -26,13 +26,6 @@ typedef struct Ray {
 	float3 direction;
 	float3 origin;
 }Ray;
-
-typedef struct ray {
-	float3 origin;
-	float3 direction;
-	float3 radiance;
-	float terminate;
-} ray;
 
 typedef struct Camera {
 	float3 lowleftcorner;
@@ -49,11 +42,10 @@ typedef struct Material {
 	float ior;
 }Material;
 
-typedef struct Photon {
+typedef struct Path {
 	Ray reverse;
-	float distance;
-	int indx;
-}Photon;
+	int depth;
+}Path;
 
 typedef struct Polygon {
 	float3 dot[3];
@@ -61,13 +53,6 @@ typedef struct Polygon {
 	float D;
 	Material material;
 }Polygon;
-
-typedef struct Sphere {
-	float3 center;
-	float radius;
-	Material material;
-	int pn;
-}Sphere;
 
 typedef struct Hit_record {
 	float3 point;
@@ -117,9 +102,24 @@ __device__ Ray shoot_ray(int stage, Camera &cam, curandState* gState) {
 	return tmp;
 }
 
-__device__ Ray shoot_ray(Sphere s, curandState *gState) {
+__device__ bool try_dot(Polygon p, float3 point) {
+	if (dot(cross(p.dot[1] - p.dot[0], point - p.dot[0]), p.normal) < 0.001f) return false;
+	if (dot(cross(point - p.dot[0], p.dot[2] - p.dot[0]), p.normal) < 0.001f) return false;
+	if (dot(cross(p.dot[1] - point, p.dot[2] - point), p.normal) < 0.001f) return false;
+	return true;
+}
+
+__device__ Ray shoot_ray(Polygon p, curandState *gState) {
 	float3 dir = normalize(make_float3(rand_f2m1(gState), rand_f2m1(gState), rand_f2m1(gState)));
-	return {dir, s.center + dir * s.radius};
+	float3 ori, a = p.dot[1] - p.dot[0], b = p.dot[2] - p.dot[0];
+	if (dot(dir, p.normal) < 0) dir = -dir;
+	float p1, p2;
+	do {
+		p1 = rand_f(gState);
+		p2 = rand_f(gState);
+		ori = p.dot[0] + p1 * a + p2 * b;
+	} while (!try_dot(p, ori));
+	return {dir, ori};
 }
 
 __device__ float3 get_ray(Ray r, float k) {
@@ -131,7 +131,9 @@ __device__ float3 reflection(float3 v1, float3 v2) {
 }
 
 __device__ bool diffusion(curandState* gState, Ray r, Ray &scattered, Hit_record &rec, float3 &attenuated){
-	if (length(rec.material.emissivity) > 0) return false;
+	if (rec.material.emissivity.x > 0 || rec.material.emissivity.y > 0 
+		|| rec.material.emissivity.z > 0) return false;
+
 	float ran = rand_f(gState);
 
 	if (ran < rec.material.reflectivity && rec.material.refractivity == 0.0f) {
@@ -152,62 +154,59 @@ __device__ bool diffusion(curandState* gState, Ray r, Ray &scattered, Hit_record
 	return true;
 }
 
-__device__ bool get_intersection(Ray r, Hit_record &rec, float dist, Sphere s) {
-	float3 oc = r.origin - s.center;
+__device__ bool get_intersection(Ray r, Hit_record &rec, float dist, Polygon p) {
+	if (dot(p.normal, r.direction) == 0) return false;
 
-	float a = dot(r.direction, r.direction);
-	float b = 2.0f * dot(oc, r.direction);
-	float c = dot(oc, oc) - s.radius * s.radius;
-	float D = b * b - 4.0f * a * c;
+	float A = p.normal.x, B = p.normal.y, C = p.normal.z, D = p.D;
+	float3 point, o = r.origin, d = r.direction;
 
-	if (D > 0) {
-		float d1 = (-b - sqrt(D)) / (2.0f * a);
-		float d2 = (-b + sqrt(D)) / (2.0f * a);
-		float root = (d1 < d2) ? d1 : d2;
+	point.y = o.y * ((A * d.x + C * d.z)/d.y) - D - A * o.x - C * o.z;
+	point.y = point.y / ((A * d.x + C * d.z)/d.y + B);
+	point.x = d.x * ((point.y - o.y)/d.y) + o.x;
+	point.z = d.z * ((point.y - o.y)/d.y) + o.z;
 
-		if (root < dist && root > 0.001f) {	
-			rec.point = get_ray(r, root);
-			rec.normal = (rec.point - s.center) / s.radius;
-			rec.depth = root;
-			rec.material = s.material;
-			
-			return true;
-		}
+	if (dot(r.origin - point, -p.normal) > 0.0f) return false;
+	if (dot(r.origin - point, r.direction) > 0.0f) return false;
+	float depth = length(r.origin - point);
+	if (depth < dist && depth > 0.001f) {
+		if (!try_dot(p, point)) return false;
+		rec.point = point;
+		rec.normal = p.normal;
+		rec.depth = depth;
+		rec.material = p.material;
+		return true;	
 	}
 	return false;
 }
 
-__device__ bool nearest_intersection (Ray r, int &indx, Sphere *scene, Hit_record &rec, int n_obj) {
+__device__ bool nearest_intersection (Ray r, Polygon *scene, Hit_record &rec, int n_obj) {
 	float dist = 1E+37f;
 	bool hit = false;
 	for (int i = 0; i < n_obj; ++i) {
 		if (get_intersection(r, rec, dist, scene[i])) {
 			hit = true;
 			dist = rec.depth;
-			indx = i;
 		}
 	}
 	return hit;
 
 }
 
-__device__ float3 inverse_raytrace(curandState* gState, Sphere *scene, Ray r, int n_obj) {
+__device__ float3 inverse_raytrace(curandState* gState, Path *pMap, int path_num, Polygon *scene, Ray r, int n_obj) {
 	Ray primary = r;
 	Hit_record rec;
 	float3 attenuated;
 	float3 emitted;
 	float3 composite = {0.0f, 0.0f, 0.0f};
 	float3 counted = {1.0f, 1.0f, 1.0f};
-
+	Ray scattered;
 	for (int i = 0; i < MAX_DEPTH; ++i) {
-		int j;
-		if (nearest_intersection(primary, j, scene, rec, n_obj)) {
+		if (nearest_intersection(primary, scene, rec, n_obj)) {
 			// return rec.material.color;
 			emitted = rec.material.emissivity;
-			Ray scattered;
 			if (diffusion(gState, primary, scattered, rec, attenuated)) {
 				primary = scattered;
-				composite += (emitted + attenuated) * counted;
+				composite += emitted * counted;
 				counted = counted * attenuated;
 			} else {
 				return composite + emitted * counted;
@@ -216,58 +215,88 @@ __device__ float3 inverse_raytrace(curandState* gState, Sphere *scene, Ray r, in
 			return {0, 0, 0};
 		}
 	}
+	// int it = (int) (rand_f(gState) * path_num);
+	// if (rec.material.reflectivity != 1) {
+	// 	float3 dir = pMap[it].reverse.origin - primary.origin;
+	// 	float dist = length(dir);
+	// 	dir = dir/dist;
+	// 	primary = {dir, primary.origin};
+	// 	if (nearest_intersection(primary, scene, rec, n_obj)) {
+	// 		if (length(rec.point - primary.origin) < dist) return {0, 0, 0};
+	// 		emitted = rec.material.emissivity;
+	// 		primary = { pMap[it].reverse.direction, pMap[it].reverse.origin};
+	// 		composite += emitted * counted;
+	// 		counted = counted * rec.material.color;
+	// 	}
+	// 	for (int i = 0; i < pMap[it].depth + 1; ++i) {
+	// 		if (nearest_intersection(primary, scene, rec, n_obj)) {
+	// 			// return rec.material.color;
+	// 			if (rec.material.reflectivity > 0) rec.material.reflectivity = 1;
+	// 			emitted = rec.material.emissivity;
+	// 			if (diffusion(gState, primary, scattered, rec, attenuated)) {
+	// 				primary = scattered;
+	// 				composite += emitted * counted;
+	// 				counted = counted * attenuated;
+	// 			} else {
+	// 				return composite + emitted * counted;
+	// 			}
+	// 		} else {
+	// 			return {0, 0, 0};
+	// 		}
+	// 	}
+	// }
+
 	return {0, 0, 0};
 	// return composite + emitted * counted;
 }
 
-__device__ Photon direct_raytrace(curandState* gState, Sphere *scene, Ray r, int n_obj) {
-	Photon photon;
+__device__ Path direct_raytrace(curandState* gState, Polygon *scene, Ray r, int n_obj) {
+	Path guide = {{{0, 0, 0}, {0, 0, 0}}, 0};
 	Ray primary = r;
 	Hit_record rec;
-	int j;
+	// int j;
 	for (int i = 0; i < MAX_DEPTH; ++i) {
-		if (nearest_intersection(primary, j, scene, rec, n_obj)) {
-			if (rec.material.reflectivity == 0.0f) {
-				photon.reverse.origin = rec.point;
-				photon.distance = length(primary.origin - rec.point);
-				photon.reverse.direction = -r.direction;
-				photon.indx = j;
-				return photon;
+		if (nearest_intersection(primary, scene, rec, n_obj)) {
+			if (rec.material.emissivity.x > 0 || rec.material.emissivity.y > 0
+				|| rec.material.emissivity.z > 0) {
+				guide = {{{0, 0, 0}, {0, 0, 0}}, 0};
+				return guide;
+			} else if (rec.material.reflectivity == 0.0f) {
+				guide.reverse.origin = rec.point;
+				guide.reverse.direction = -r.direction;
+				guide.depth = i;
+				return guide;
 			} else if (rec.material.reflectivity > 0.0f) {
 				float3 refl = normalize(reflection(primary.direction, rec.normal));
 				primary = {refl, rec.point};
-			} else if (length(rec.material.emissivity) > 0.0f) {
-				photon = {{{0, 0, 0}, {0, 0, 0}}, 0, 2147483647};
-				return photon;
 			}
 		} else {
-			photon = {{{0, 0, 0}, {0, 0, 0}}, 0, 2147483647};
-			return photon;
+			guide = {{{0, 0, 0}, {0, 0, 0}}, 0};
+			return guide;
 		}
 	}
-	photon = {{{0, 0, 0}, {0, 0, 0}}, 0, 2147483647};
-	return photon;
+	return guide;
 }
 
 //**************KERNEL**************//
 
-__global__ void direct(curandState* gState, unsigned long seed, Sphere *scene, Photon *result, int n_obj, int *ligths, int light_obj) {
+__global__ void direct(curandState* gState, unsigned long seed, Polygon *scene, Path *result, int n_obj, int *ligths, int light_obj) {
 	int indx = blockDim.x * blockIdx.x + threadIdx.x;
 	curand_init (seed, indx, 0, &gState[indx]);
-	int j, shift = indx * RPT;
+	int j, shift = indx * PPT;
+	// result[shift].reverse.direction = {0, 0, 0};
 	Ray primary;
-	for (int i = 0; i < RPT; ++i) {
+	for (int i = 0; i < PPT; ++i) {
 		j = ligths[(int)(rand_f(gState) * light_obj)];
 		primary = shoot_ray(scene[j], gState);
 		result[shift + i] = direct_raytrace(gState, scene, primary, n_obj);
 	}
 }
 
-__global__ void inverse(int stage, curandState* gState, Sphere *scene, float3 *result, int n, int n_obj) {
+__global__ void inverse(int stage, curandState* gState, Path *pMap, int path_num, Polygon *scene, float3 *result, int n, int n_obj) {
 	int indx = blockDim.x * blockIdx.x + threadIdx.x;
-	
 	Camera cam;
-	create_camera(cam, make_float3(-1, 100, 0), make_float3(0, 0, 0), 40.0f);
+	create_camera(cam, make_float3(-1800, 525.55f, 0), make_float3(0, 350, 0), 40.0f);
 	
 	if (indx < n) {
 		Ray primary;
@@ -275,7 +304,7 @@ __global__ void inverse(int stage, curandState* gState, Sphere *scene, float3 *r
 		float scaled = 1.0f / (float) SAMPLES;
 		for (int i = 0; i < SAMPLES; ++i) {
 			primary = shoot_ray(stage, cam, gState);
-			result[indx + stage * BLOCKS * THREADS] += inverse_raytrace(gState, scene, primary, n_obj) * scaled;
+			result[indx + stage * BLOCKS * THREADS] += inverse_raytrace(gState, pMap, path_num, scene, primary, n_obj) * scaled;
 		}
 	}
 }
@@ -287,10 +316,7 @@ __global__ void inverse(int stage, curandState* gState, Sphere *scene, float3 *r
 // __host__ inline int gamma_correction(float val) {return val * 256;}
 __host__ inline int gamma_correction(float val) { return int(255.0f * sqrt(fmaxf(0.0f, fminf(1.0f, val))));}
 
-// __host__ void print_file_header(ofstream &file);
-__host__ int compare (const void * a, const void * b);
 __host__ void find_normal(Polygon &p);
-__host__ Sphere * init_spheres(int &n_obj);
 __host__ Polygon * init_polygons(int &n_obj);
 __host__ void * alloc_mem_cpu(size_t size);
 __host__ void mem_cpy_to_gpu(void *d, void *g, size_t size);
@@ -304,38 +330,41 @@ int main() {
 	int n_obj;
 	size_t sizer = sizeof(float3) * NELEMS;
 	size_t sizec = sizeof(curandState) * NELEMS;
-	size_t sizep = sizeof(Photon) * NELEMS * RPT;
-	Sphere *h_scene = NULL;
-	Photon *h_photon = (Photon *) alloc_mem_cpu(sizep);
+	size_t sizep = sizeof(Path) * BLOCKS * THREADS * PPT;
+	Polygon *h_scene = NULL;
+	Path *h_path = (Path *) alloc_mem_cpu(sizep);
 	// float3 *h_result = (float3 *) alloc_mem_cpu(sizer);
 
-	h_scene = init_spheres(n_obj);
-	size_t sizes = sizeof(Sphere) * n_obj;
+	h_scene = init_polygons(n_obj);
+	size_t sizes = sizeof(Polygon) * n_obj;
 
 	int light_obj = 0;
 	for (int i = 0; i < n_obj; ++i) {
-		if (length(h_scene[i].material.emissivity) > 0)
+		if (h_scene[i].material.emissivity.x > 0 || h_scene[i].material.emissivity.y > 0
+			|| h_scene[i].material.emissivity.z > 0)
 			++light_obj;
 	}
 	size_t sizel = sizeof(int *) * light_obj;
 	int *h_lights = (int *) alloc_mem_cpu(sizel);
 	for (int i = 0, j = 0; i < n_obj; ++i) {
-		if (length(h_scene[i].material.emissivity) > 0) {
+		if (h_scene[i].material.emissivity.x > 0 || h_scene[i].material.emissivity.y > 0
+			|| h_scene[i].material.emissivity.z > 0) {
 			h_lights[j] = i; 
 			++j;
 		}
 	}
 	/* Allocate vectors on device */
-	Sphere *d_scene = NULL;
+	Polygon *d_scene = NULL;
 	int *d_ligths = NULL;
-	Photon *d_photon = NULL;
+	Path *d_path = NULL;
+	// float3 *d_result = NULL;
 	curandState* d_states = NULL;
 
-	d_scene = (Sphere *)alloc_mem_gpu(sizes);	
+	d_scene = (Polygon *) alloc_mem_gpu(sizes);
 	d_ligths = (int *) alloc_mem_gpu(sizel);
-	d_photon = (Photon *) alloc_mem_gpu(sizep);
+	d_path = (Path *) alloc_mem_gpu(sizep);
 	// d_result = (float3 *)alloc_mem_gpu(sizer);    
-	d_states = (curandState*)alloc_mem_gpu(sizec);
+	d_states = (curandState*) alloc_mem_gpu(sizec);
 
 	/* Copy the host vectors to device */
 
@@ -345,55 +374,42 @@ int main() {
 	int threadsPerBlock = THREADS;
 	int blocksPerGrid = BLOCKS; //(NELEMS + threadsPerBlock - 1) / threadsPerBlock;
 	int maxStage = NELEMS/(BLOCKS * THREADS) + (NELEMS%(BLOCKS * THREADS) != 0) * 1;
+	
 
-	direct<<<blocksPerGrid, threadsPerBlock>>>(d_states, time(NULL), d_scene, d_photon, n_obj, d_ligths, light_obj);
-	cudaError_t error = cudaGetLastError();
+	direct<<<blocksPerGrid, threadsPerBlock>>>(d_states, time(NULL), d_scene, d_path, n_obj, d_ligths, light_obj);
+	cudaError_t error;
+	error = cudaGetLastError();
 	if (error != cudaSuccess) {
-		cout << "Failed to launch Direct!\n";
+		cout << "Failed to launch inverse!\n";
 		cudaErrors(error);
 		exit(EXIT_FAILURE);
 	}
-	mem_cpy_to_cpu(d_photon, h_photon, sizep);
+	mem_cpy_to_cpu(d_path, h_path, sizep);
 	cout << "direct method is done!\n";
-	qsort(h_photon, NELEMS * RPT, sizeof(Photon), compare);
-	int num_photon = 0, last_spher = 0;
-	h_scene[0].pn = 0;
-	// ofstream fi_out("out");
-	for (int i = 0; i < NELEMS * RPT; ++i) {
-		if (h_photon[i].distance != 0) {
-			++num_photon;
-			if (last_spher != h_photon[i].indx) {
-				last_spher = h_photon[i].indx;
-				h_scene[last_spher].pn = i;
-			}
-			// Ray r = h_photon[i].reverse;
-			// fi_out << r.origin.x << ":" << r.origin.y << ":" << r.origin.z << "\t\t";
-			// fi_out << r.direction.x << ":" << r.direction.y << ":" << r.direction.z << "\t\t";
-			// fi_out << h_photon[i].distance << ":" << h_photon[i].indx << "\n";
-		}
+	int num_path = 0;
+	for (int i = 0; i < BLOCKS * THREADS * PPT; ++i) {
+		if (h_path[i].reverse.direction.x != 0 || h_path[i].reverse.direction.y != 0
+			|| h_path[i].reverse.direction.z != 0) ++num_path;
 	}
-	for (int i = 0; i < n_obj; ++i) {
-		cout << h_scene[i].pn << endl;
-	}
-	// fi_out.close();
-	// free(h_photon);
-	// cudaFree(d_photon);
-
-	mem_cpy_to_gpu(h_scene, d_scene, sizes);
+	cout << num_path << "\n";
+	free(h_lights);
+	cudaFree(d_ligths);
+	mem_cpy_to_gpu(h_path, d_path, sizep);
 	float3 *h_result = (float3 *) alloc_mem_cpu(sizer);
-	float3 *d_result = NULL;	
-	d_result = (float3 *) alloc_mem_gpu(sizer); 
+	float3 *d_result = NULL;
+	d_result = (float3 *) alloc_mem_gpu(sizer);
+
 	for (int i = 0; i < maxStage; ++i) {
-		inverse<<<blocksPerGrid, threadsPerBlock>>>(i, d_states, d_scene, d_result, BLOCKS * THREADS, n_obj);
+		inverse<<<blocksPerGrid, threadsPerBlock>>>(i, d_states, d_path, num_path, d_scene, d_result, BLOCKS * THREADS, n_obj);
 		error = cudaGetLastError();
 		if (error != cudaSuccess) {
-			cout << "Failed to launch Inverse method!\n";
+			cout << "Failed to launch inverse!\n";
 			cudaErrors(error);
 			exit(EXIT_FAILURE);
 		}
 	}
+		
 	mem_cpy_to_cpu(d_result, h_result, sizer);
-	cout << "inverse method is done!\n";
 	ofstream fout("img.ppm");
 	fout << "P3\n" << WIDTH << " " << HEIGHT << "\n255\n";
 	for (int i = 0; i < NELEMS; ++i) {
@@ -403,26 +419,15 @@ int main() {
 	}
 	fout.close();
 	cout << "We Fine!\n";
+	cudaFree(d_path);
 	cudaFree(d_scene);
 	cudaFree(d_result);
 	cudaFree(d_states);
+	free(h_path);
 	free(h_result);
 	free(h_scene);
 	cudaDeviceReset();
 	return 0;
-}
-
-// __host__ void print_file_header(ofstream &file) {
-// 	file << (uint8_t)'B' << (uint8_t)'M' << (uint32_t)WIDTH * HEIGHT * 3 + 54;
-// 	file << (uint16_t)0 << (uint16_t)0 << (uint32_t)54 << (uint32_t)40;
-// 	file << (uint32_t)WIDTH << (uint32_t)HEIGHT << (uint16_t)1;
-// 	file << (uint16_t)24 << (uint32_t)0 << (uint32_t)0 << (uint32_t)0;
-// 	file << (uint32_t)0 << (uint32_t)0 << (uint32_t)0;
-// }
-
-__host__ int compare(const void * a, const void * b) {
-	Photon ap = *(Photon *) a, bp = *(Photon *) b;
-	return ap.indx - bp.indx;
 }
 
 __host__ void find_normal(Polygon &p) {
@@ -450,35 +455,13 @@ __host__ Material * init_materials(int &m) {
 	return materials;
 }
 
-__host__ Sphere * init_spheres(int &n_obj) {
-	int m;
-	Material *materials = init_materials(m);
-	ifstream infile("inSpher");
-	infile >> n_obj;
-
-	size_t sizeScene = sizeof(Sphere) * n_obj;
-	Sphere *scene = (Sphere *)alloc_mem_cpu(sizeScene);
-
-	for (int i = 0; i < n_obj; ++i) {
-		infile >> scene[i].center.x >> scene[i].center.y >> scene[i].center.z;
-		infile >> scene[i].radius;
-		int tmp;
-		infile >> tmp;
-		scene[i].material = materials[tmp];
-		scene[i].pn = -1;
-	}
-	infile.close();
-	free(materials);
-	return scene;
-}
-
 __host__ Polygon * init_polygons(int &n_obj) {
-	int m;
+	int m, box;
 	Material *materials = init_materials(m);
 	ifstream infile("inPolygon");
-	infile >> n_obj;
+	infile >> n_obj >> box;
 
-	size_t sizeScene = sizeof(Polygon) * n_obj;
+	size_t sizeScene = sizeof(Polygon) * (n_obj + box * 12);
 	Polygon *scene = (Polygon *)alloc_mem_cpu(sizeScene);
 
 	for (int i = 0; i < n_obj; ++i) {
@@ -491,8 +474,118 @@ __host__ Polygon * init_polygons(int &n_obj) {
 	    find_factor(scene[i]);
 	    // cout << scene[i].normal.x << ":" << scene[i].normal.y << ":" << scene[i].normal.z << "\n\n";
 	}
-	infile.close();
+	float3 dot[8];
+	for (int i = 0; i < box; ++i) {
+		for (int j = 0; j < 4; ++j) {
+			infile >> dot[j].x >> dot[j].y >> dot[j].z;
+			// cout << "[" << dot[j].x << ":" << dot[j].y << ":" << dot[j].z << "]";
+		}
+		// cout << "\n";
 
+		float h;
+		infile >> h;
+
+		for (int j = 0; j < 4; ++j) {
+			dot[4 + j] = dot[j];
+			dot[4 + j].y = dot[j].y + h;
+			// cout << "[" << dot[4 + j].x << ":" << dot[4 + j].y << ":" << dot[4 + j].z << "]";
+		}
+		// cout << "\n";
+		
+		int tmp;
+		infile >> tmp;
+
+		scene[n_obj + i * 12].dot[0] = dot[0];
+		scene[n_obj + i * 12].dot[1] = dot[1];
+		scene[n_obj + i * 12].dot[2] = dot[2];
+		scene[n_obj + i * 12].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12]);
+		find_factor(scene[n_obj + i * 12]);
+
+		scene[n_obj + i * 12 + 1].dot[0] = dot[2];
+		scene[n_obj + i * 12 + 1].dot[1] = dot[3];
+		scene[n_obj + i * 12 + 1].dot[2] = dot[0];
+		scene[n_obj + i * 12 + 1].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 1]);
+		find_factor(scene[n_obj + i * 12 + 1]);
+
+		scene[n_obj + i * 12 + 2].dot[0] = dot[4];
+		scene[n_obj + i * 12 + 2].dot[1] = dot[6];
+		scene[n_obj + i * 12 + 2].dot[2] = dot[5];
+		scene[n_obj + i * 12 + 2].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 2]);
+		find_factor(scene[n_obj + i * 12 + 2]);
+
+		scene[n_obj + i * 12 + 3].dot[0] = dot[6];
+		scene[n_obj + i * 12 + 3].dot[1] = dot[4];
+		scene[n_obj + i * 12 + 3].dot[2] = dot[7];
+		scene[n_obj + i * 12 + 3].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 3]);
+		find_factor(scene[n_obj + i * 12 + 3]);
+
+		scene[n_obj + i * 12 + 4].dot[0] = dot[0];
+		scene[n_obj + i * 12 + 4].dot[1] = dot[3];
+		scene[n_obj + i * 12 + 4].dot[2] = dot[4];
+		scene[n_obj + i * 12 + 4].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 4]);
+		find_factor(scene[n_obj + i * 12 + 4]);
+
+		scene[n_obj + i * 12 + 5].dot[0] = dot[4];
+		scene[n_obj + i * 12 + 5].dot[1] = dot[3];
+		scene[n_obj + i * 12 + 5].dot[2] = dot[7];
+		scene[n_obj + i * 12 + 5].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 5]);
+		find_factor(scene[n_obj + i * 12 + 5]);
+
+		scene[n_obj + i * 12 + 6].dot[0] = dot[3];
+		scene[n_obj + i * 12 + 6].dot[1] = dot[2];
+		scene[n_obj + i * 12 + 6].dot[2] = dot[7];
+		scene[n_obj + i * 12 + 6].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 6]);
+		find_factor(scene[n_obj + i * 12 + 6]);
+
+		scene[n_obj + i * 12 + 7].dot[0] = dot[7];
+		scene[n_obj + i * 12 + 7].dot[1] = dot[2];
+		scene[n_obj + i * 12 + 7].dot[2] = dot[6];
+		scene[n_obj + i * 12 + 7].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 7]);
+		find_factor(scene[n_obj + i * 12 + 7]);
+
+		scene[n_obj + i * 12 + 8].dot[0] = dot[2];
+		scene[n_obj + i * 12 + 8].dot[1] = dot[1];
+		scene[n_obj + i * 12 + 8].dot[2] = dot[6];
+		scene[n_obj + i * 12 + 8].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 8]);
+		find_factor(scene[n_obj + i * 12 + 8]);
+
+		scene[n_obj + i * 12 + 9].dot[0] = dot[6];
+		scene[n_obj + i * 12 + 9].dot[1] = dot[1];
+		scene[n_obj + i * 12 + 9].dot[2] = dot[5];
+		scene[n_obj + i * 12 + 9].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 9]);
+		find_factor(scene[n_obj + i * 12 + 9]);
+
+		scene[n_obj + i * 12 + 10].dot[0] = dot[1];
+		scene[n_obj + i * 12 + 10].dot[1] = dot[0];
+		scene[n_obj + i * 12 + 10].dot[2] = dot[5];
+		scene[n_obj + i * 12 + 10].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 10]);
+		find_factor(scene[n_obj + i * 12 + 10]);
+
+		scene[n_obj + i * 12 + 11].dot[0] = dot[5];
+		scene[n_obj + i * 12 + 11].dot[1] = dot[0];
+		scene[n_obj + i * 12 + 11].dot[2] = dot[4];
+		scene[n_obj + i * 12 + 11].material = materials[tmp];
+		find_normal(scene[n_obj + i * 12 + 11]);
+		find_factor(scene[n_obj + i * 12 + 11]);
+
+	    // scene[i].material = materials[tmp];
+		// find_normal(scene[i]);
+		// find_factor(scene[i]);
+	    // cout << scene[i].normal.x << ":" << scene[i].normal.y << ":" << scene[i].normal.z << "\n\n";
+	}
+	infile.close();
+	n_obj = n_obj + box * 12;
 	free(materials);
 	return scene;
 }
